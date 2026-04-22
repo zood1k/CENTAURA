@@ -1,0 +1,42 @@
+local bajookie = game.Players.LocalPlayer
+local dmg = game.ReplicatedStorage.TREKRemotes.DamagerRemote
+
+local function gun()
+    local c = bajookie.Character
+    if c then
+        local t = c:FindFirstChildOfClass("Tool")
+        if t and t:FindFirstChild("Gun") then return t.Gun end
+    end
+    local bp = bajookie:FindFirstChild("Backpack")
+    if bp then
+        for _, t in ipairs(bp:GetChildren()) do
+            if t:FindFirstChild("Gun") then return t.Gun end
+        end
+    end
+end
+
+local function barrel()
+    local c = bajookie.Character
+    if c then
+        local t = c:FindFirstChildOfClass("Tool")
+        if t then
+            local b = t:FindFirstChild("Barrel", true)
+            if b and b:IsA("BasePart") then return b.Position end
+            if t:FindFirstChild("Handle") then return t.Handle.Position end
+        end
+        if c:FindFirstChild("Head") then return c.Head.Position end
+    end
+    return Vector3.zero
+end
+
+for _, p in ipairs(game.Players:GetPlayers()) do
+    if p ~= bajookie and p.Team ~= bajookie.Team then
+        local c = p.Character
+        if c and c:FindFirstChildOfClass("Humanoid") and c.Humanoid.Health > 0 then
+            local hit = c:FindFirstChild("Head") or c:FindFirstChild("HumanoidRootPart")
+            if hit then
+                dmg:FireServer(gun(), barrel(), c, 1000, hit, "Melee")
+            end
+        end
+    end
+end
