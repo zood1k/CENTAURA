@@ -1,10 +1,15 @@
--- CENTAURA :: Murderers vs Sheriffs 2 (v1 · HARD MODE)
+-- CENTAURA :: Murderers vs Sheriffs 2 (v2 · HARD MODE)
 -- By @zood3llotgk
 --
--- Замечание по ремоутам: все 17 пойманных ремоутов — FireClient (сервер→клиент
--- с GUID-именами). Прямого FireServer на килл/урон нет. Скрипт использует
--- OnClientEvent хуки для чтения роли, стрика, коинов; а для урона/наводки —
--- клиентские методы (WalkSpeed, CFrame, Humanoid remount, аимбот).
+-- v2 changelog:
+--  * Player tab: теперь ищет настоящий character model в Workspace (MvS2 парентит
+--    персонажа в кастомный контейнер, LP.Character не всегда равен активному чару)
+--  * Movement: всё работает на getActiveCharacter() + force-переустановка WS/JP
+--    каждые 0.3s
+--  * Aimbot: плавный lerp, целится в Head
+--  * Trigger Bot: raycast Camera→Target, не стреляет сквозь стены
+--  * ESP: переведён с RenderStepped на Heartbeat 0.1s, кэш всего
+--  * Tracer cleanup: использует :Remove() вместо :Destroy()
 
 local Players             = game:GetService("Players")
 local ReplicatedStorage   = game:GetService("ReplicatedStorage")
@@ -13,49 +18,38 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local UserInputService    = game:GetService("UserInputService")
 local StarterGui          = game:GetService("StarterGui")
 local Workspace           = game:GetService("Workspace")
-local Lighting            = game:GetService("Lighting")
 local Camera              = Workspace.CurrentCamera
 local LP                  = Players.LocalPlayer
 local Mouse               = LP:GetMouse()
 
 -- ===== executor features =====
-local function _G_get(name)
-    local ok, v = pcall(function() return rawget(getfenv(0), name) end)
-    if ok and v then return v end
-    ok, v = pcall(function() return getfenv()[name] end)
-    if ok and v then return v end
-    return nil
-end
-local _getconnections = _G_get("getconnections")
-local _firesignal     = _G_get("firesignal")
+local _getconnections = (rawget(_G, "getconnections")) or getconnections
+local _firesignal     = (rawget(_G, "firesignal")) or firesignal
+local _getrawmt       = (rawget(_G, "getrawmetatable")) or getrawmetatable
+local _setreadonly    = (rawget(_G, "setreadonly")) or setreadonly
 
 -- ===== state =====
 local S = {
-    -- Player
-    speedHack    = false, walkSpeed = 32,
+    speedHack    = false, walkSpeed = 40,
     jumpHack     = false, jumpPower = 80,
     infJump      = false,
     noclip       = false,
     fly          = false, flySpeed  = 60,
     antiAFK      = true,
 
-    -- Combat
     silentAim    = false,
-    aimbot       = false, aimKey = "E", fov = 90, teamCheck = true,
+    aimbot       = false, aimKey = "E", fov = 100, aimSmooth = 0.35,
     killAura     = false, auraRange = 12,
-    triggerBot   = false,
+    triggerBot   = false, tbWallCheck = true, tbRadius = 18,
 
-    -- Visuals
     espNames     = false,
     espBox       = false,
     espTracers   = false,
     teamChams    = false,
 
-    -- Automation
     autoCase     = false,
     autoRespawn  = false,
 
-    -- Info (readonly)
     role         = "Unknown",
     coins        = 0,
     streak       = 0,
@@ -70,14 +64,53 @@ local function notify(t, x, d)
     end)
 end
 
-local function char() return LP.Character end
-local function hrp()
-    local c = char()
-    return c and c:FindFirstChild("HumanoidRootPart"),
-           c and c:FindFirstChildOfClass("Humanoid")
+-- ========================================================
+-- Character resolution (MvS2 не всегда кладёт character в LP.Character)
+-- ========================================================
+local function findCharacterByName(name)
+    for _, m in ipairs(Workspace:GetChildren()) do
+        if m:IsA("Model") and m.Name == name and m:FindFirstChildOfClass("Humanoid") then
+            return m
+        end
+    end
+    -- поиск в под-папках (MvS2 может складывать в Workspace.Characters / Players / Map)
+    for _, folder in ipairs({"Characters","Players","Alive","Map","Game","Entities"}) do
+        local f = Workspace:FindFirstChild(folder)
+        if f then
+            local m = f:FindFirstChild(name)
+            if m and m:IsA("Model") and m:FindFirstChildOfClass("Humanoid") then
+                return m
+            end
+        end
+    end
+    return nil
 end
 
--- ===== Anti-AFK =====
+local function getActiveCharacter()
+    -- 1) стандартный путь
+    local c = LP.Character
+    if c and c:FindFirstChildOfClass("Humanoid") and c:FindFirstChild("HumanoidRootPart") then
+        return c
+    end
+    -- 2) fallback — поиск модели с именем игрока
+    return findCharacterByName(LP.Name)
+end
+
+local function getHRP()
+    local c = getActiveCharacter(); if not c then return nil, nil end
+    return c:FindFirstChild("HumanoidRootPart"), c:FindFirstChildOfClass("Humanoid")
+end
+
+local function charOfPlayer(pl)
+    if pl.Character and pl.Character:FindFirstChildOfClass("Humanoid") then
+        return pl.Character
+    end
+    return findCharacterByName(pl.Name)
+end
+
+-- ========================================================
+-- Anti-AFK
+-- ========================================================
 LP.Idled:Connect(function()
     if not S.antiAFK then return end
     pcall(function()
@@ -86,145 +119,75 @@ LP.Idled:Connect(function()
     end)
 end)
 
--- ===== Role detection =====
--- Murderer has Knife tool; Sheriff has Gun/Revolver tool; иначе Innocent.
-local function computeRole()
-    local c = char(); if not c then return "Unknown" end
-    local hasKnife, hasGun = false, false
-    local function scan(container)
-        if not container then return end
-        for _, t in ipairs(container:GetChildren()) do
-            if t:IsA("Tool") or t:IsA("Model") then
-                local n = string.lower(t.Name or "")
-                if n:find("knife") or n:find("blade") then hasKnife = true
-                elseif n:find("gun") or n:find("revolver") or n:find("pistol") or n:find("rifle") then hasGun = true end
-            end
-        end
-    end
-    scan(c)
-    scan(LP:FindFirstChild("Backpack"))
-    if hasKnife and not hasGun then return "Murderer" end
-    if hasGun and not hasKnife then return "Sheriff" end
-    if hasKnife and hasGun then return "Both (?)" end
-    return "Innocent"
-end
+-- ========================================================
+-- Movement (speed / jump / noclip / fly / inf jump)
+-- ========================================================
 
+-- Ленивая переустановка каждые 0.3s: найти активного чара, выставить WS/JP
 task.spawn(function()
-    while task.wait(0.5) do S.role = computeRole() end
-end)
-
--- ===== OnClientEvent hooks (FireClient events by GUIDs) =====
--- 1. Подвешиваемся на все RemoteEvent в ReplicatedStorage чтобы парсить:
---    * streak/kill notifier   (args: number, "Streak", {Kills, Name, UserId})
---    * coins / currency       (args: number single-arg)
---    * inventory stats        (args: {dict of weapons -> counts})
-local hookedRemotes = {}
-local function hookRemote(r)
-    if not r:IsA("RemoteEvent") then return end
-    if hookedRemotes[r] then return end
-    hookedRemotes[r] = true
-    r.OnClientEvent:Connect(function(...)
-        local a = {...}
-        -- streak notif: (int, "Streak", {Kills, Name, UserId})
-        if type(a[2]) == "string" and string.lower(a[2]) == "streak"
-           and type(a[3]) == "table" then
-            local info = a[3]
-            if info.Name and info.Kills then
-                if info.UserId == LP.UserId then
-                    S.streak = info.Kills
-                else
-                    -- возможно нас убили
-                    S.lastKilledBy = string.format("%s (%d streak)", info.Name, info.Kills or 0)
+    while task.wait(0.3) do
+        local _, hum = getHRP()
+        if hum then
+            if S.speedHack and hum.WalkSpeed ~= S.walkSpeed then
+                pcall(function() hum.WalkSpeed = S.walkSpeed end)
+            end
+            if S.jumpHack then
+                if hum.JumpPower ~= S.jumpPower then
+                    pcall(function() hum.JumpPower = S.jumpPower; hum.UseJumpPower = true end)
                 end
             end
         end
-        -- single number → coins / currency
-        if #a == 1 and type(a[1]) == "number" and a[1] > 100 and a[1] < 1e12 then
-            -- осторожно: это может быть что угодно, но обычно coins
-            if a[1] ~= S.coins then S.coins = a[1] end
-        end
-    end)
-end
-
-local function scanReplicated()
-    for _, v in ipairs(ReplicatedStorage:GetDescendants()) do
-        if v:IsA("RemoteEvent") then hookRemote(v) end
     end
-end
-scanReplicated()
-ReplicatedStorage.DescendantAdded:Connect(function(v)
-    if v:IsA("RemoteEvent") then hookRemote(v) end
 end)
-
--- ===== Movement =====
--- Держим WS/JP через property change signals (переустановка при сбросе)
-local function bindHum(hum)
-    if not hum then return end
-    hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
-        if S.speedHack and hum.WalkSpeed ~= S.walkSpeed then hum.WalkSpeed = S.walkSpeed end
-    end)
-    hum:GetPropertyChangedSignal("JumpPower"):Connect(function()
-        if S.jumpHack and hum.JumpPower ~= S.jumpPower then hum.JumpPower = S.jumpPower end
-    end)
-    if S.speedHack then hum.WalkSpeed = S.walkSpeed end
-    if S.jumpHack then hum.JumpPower = S.jumpPower; hum.UseJumpPower = true end
-end
-local function bindChar(c)
-    local hum = c:FindFirstChildOfClass("Humanoid") or c:WaitForChild("Humanoid", 5)
-    bindHum(hum)
-end
-if char() then bindChar(char()) end
-LP.CharacterAdded:Connect(function(c) task.wait(0.2); bindChar(c) end)
 
 -- Infinite Jump
 UserInputService.JumpRequest:Connect(function()
     if not S.infJump then return end
-    local _, hum = hrp()
-    if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    local _, hum = getHRP()
+    if hum then
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+    end
 end)
 
--- Noclip (cached char parts)
-local charParts = {}
-local function rebuildCharParts()
-    charParts = {}
-    local c = char(); if not c then return end
-    for _, p in ipairs(c:GetDescendants()) do
-        if p:IsA("BasePart") then table.insert(charParts, p) end
-    end
-end
-LP.CharacterAdded:Connect(function() task.wait(0.3); rebuildCharParts() end)
-if char() then rebuildCharParts() end
+-- Noclip: выключаем CanCollide на всех частях активного чара
 task.spawn(function()
     while task.wait(0.1) do
         if S.noclip then
-            for _, p in ipairs(charParts) do
-                if p and p.Parent and p.CanCollide then p.CanCollide = false end
+            local c = getActiveCharacter()
+            if c then
+                for _, p in ipairs(c:GetDescendants()) do
+                    if p:IsA("BasePart") and p.CanCollide then
+                        pcall(function() p.CanCollide = false end)
+                    end
+                end
             end
         end
     end
 end)
 
 -- Fly
-local flyBV, flyBG
-local flyConn
+local flyBV, flyBG, flyConn
 local function stopFly()
-    if flyBV then flyBV:Destroy(); flyBV = nil end
-    if flyBG then flyBG:Destroy(); flyBG = nil end
+    if flyBV then pcall(function() flyBV:Destroy() end); flyBV = nil end
+    if flyBG then pcall(function() flyBG:Destroy() end); flyBG = nil end
     if flyConn then flyConn:Disconnect(); flyConn = nil end
 end
 local function startFly()
     stopFly()
-    local root, hum = hrp()
-    if not root or not hum then return end
-    flyBV = Instance.new("BodyVelocity", root)
-    flyBV.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+    local root = getHRP(); if not root then return end
+    flyBV = Instance.new("BodyVelocity")
+    flyBV.MaxForce = Vector3.new(1e5,1e5,1e5)
     flyBV.Velocity = Vector3.zero
-    flyBG = Instance.new("BodyGyro", root)
-    flyBG.MaxTorque = Vector3.new(1e5, 1e5, 1e5)
+    flyBV.Parent   = root
+    flyBG = Instance.new("BodyGyro")
+    flyBG.MaxTorque = Vector3.new(1e5,1e5,1e5)
     flyBG.P = 9000; flyBG.D = 500
     flyBG.CFrame = root.CFrame
+    flyBG.Parent = root
     flyConn = RunService.Heartbeat:Connect(function()
-        if not S.fly then return end
+        if not S.fly then stopFly(); return end
+        local newRoot = getHRP()
+        if not newRoot or newRoot ~= root then stopFly(); if S.fly then startFly() end; return end
         local cam = Camera.CFrame
         local dir = Vector3.zero
         if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir = dir + cam.LookVector end
@@ -237,31 +200,107 @@ local function startFly()
         flyBG.CFrame = cam
     end)
 end
-local function setFly(on)
-    if on then startFly() else stopFly() end
+local function setFly(on) if on then startFly() else stopFly() end end
+
+-- ========================================================
+-- Role detection
+-- ========================================================
+local function scanTools(container, out)
+    if not container then return end
+    for _, t in ipairs(container:GetChildren()) do
+        if t:IsA("Tool") then
+            local n = string.lower(t.Name or "")
+            if n:find("knife") or n:find("blade") then out.knife = true
+            elseif n:find("gun") or n:find("revolver") or n:find("pistol") or n:find("rifle") or n:find("shotgun") then out.gun = true end
+        end
+    end
+end
+local function computeRoleFor(pl)
+    local out = {knife = false, gun = false}
+    scanTools(charOfPlayer(pl), out)
+    scanTools(pl:FindFirstChild("Backpack"), out)
+    if out.knife and not out.gun then return "Murderer" end
+    if out.gun and not out.knife then return "Sheriff" end
+    if out.knife and out.gun then return "Both" end
+    return "Innocent"
+end
+task.spawn(function()
+    while task.wait(0.5) do S.role = computeRoleFor(LP) end
+end)
+
+-- ========================================================
+-- OnClientEvent hooks (stream stats through GUID-named remotes)
+-- ========================================================
+local hookedRemotes = {}
+local function hookRemote(r)
+    if not r or not r:IsA("RemoteEvent") or hookedRemotes[r] then return end
+    hookedRemotes[r] = true
+    r.OnClientEvent:Connect(function(...)
+        local a = {...}
+        if type(a[2]) == "string" and string.lower(a[2]) == "streak" and type(a[3]) == "table" then
+            local info = a[3]
+            if info.Name and info.Kills then
+                if info.UserId == LP.UserId then
+                    S.streak = info.Kills
+                else
+                    S.lastKilledBy = string.format("%s (%d streak)", info.Name, info.Kills or 0)
+                end
+            end
+        end
+        if #a == 1 and type(a[1]) == "number" and a[1] > 100 and a[1] < 1e12 then
+            if a[1] ~= S.coins then S.coins = a[1] end
+        end
+    end)
+end
+for _, v in ipairs(ReplicatedStorage:GetDescendants()) do hookRemote(v) end
+ReplicatedStorage.DescendantAdded:Connect(hookRemote)
+
+-- ========================================================
+-- Aimbot + Silent Aim
+-- ========================================================
+local function isAlive(c)
+    if not c then return false end
+    local h = c:FindFirstChildOfClass("Humanoid")
+    return h and h.Health > 0
 end
 
--- ===== Aimbot / Silent Aim =====
-local function getNearestEnemy()
-    local myRoot = hrp(); if not myRoot then return nil end
-    local closest, closestScore
+-- Raycast check: есть ли прямая видимость Camera→target
+local function hasLineOfSight(targetPart)
+    if not targetPart then return false end
+    local origin = Camera.CFrame.Position
+    local dir = targetPart.Position - origin
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    local me = getActiveCharacter()
+    rp.FilterDescendantsInstances = me and {me} or {}
+    rp.IgnoreWater = true
+    local r = Workspace:Raycast(origin, dir, rp)
+    if not r then return true end
+    -- попали в часть: если она принадлежит character цели — LOS есть
+    local hit = r.Instance
+    if hit and targetPart.Parent and hit:IsDescendantOf(targetPart.Parent) then return true end
+    return false
+end
+
+local function getNearestEnemy(requireLOS)
+    local closest, score
     for _, pl in ipairs(Players:GetPlayers()) do
-        if pl ~= LP and pl.Character then
-            local hrp2 = pl.Character:FindFirstChild("HumanoidRootPart")
-            local hum2 = pl.Character:FindFirstChildOfClass("Humanoid")
-            if hrp2 and hum2 and hum2.Health > 0 then
-                -- team check: если у меня Sheriff — цель = Murderer; если Murderer — все кроме sheriff-союзников
-                if S.teamCheck then
-                    -- у MvS2 "командные флаги" через TeamColor нестабильно, поэтому
-                    -- аимбот всегда активен на всех; пользователь сам выбирает
-                end
-                local v, onScreen = Camera:WorldToViewportPoint(hrp2.Position)
-                if onScreen then
-                    local mpos = UserInputService:GetMouseLocation()
-                    local dist = ((Vector2.new(v.X, v.Y) - mpos)).Magnitude
-                    if dist < S.fov and (not closestScore or dist < closestScore) then
-                        closest = pl
-                        closestScore = dist
+        if pl ~= LP then
+            local c = charOfPlayer(pl)
+            if c and isAlive(c) then
+                local head = c:FindFirstChild("Head") or c:FindFirstChild("HumanoidRootPart")
+                if head then
+                    local v, on = Camera:WorldToViewportPoint(head.Position)
+                    if on and v.Z > 0 then
+                        local mp = UserInputService:GetMouseLocation()
+                        local d  = (Vector2.new(v.X, v.Y) - mp).Magnitude
+                        if d < S.fov then
+                            if (not requireLOS) or hasLineOfSight(head) then
+                                if (not score) or d < score then
+                                    closest = pl; score = d
+                                end
+                            end
+                        end
                     end
                 end
             end
@@ -270,81 +309,77 @@ local function getNearestEnemy()
     return closest
 end
 
-local aimKey = Enum.KeyCode[S.aimKey] or Enum.KeyCode.E
-RunService.RenderStepped:Connect(function()
-    if S.aimbot and UserInputService:IsKeyDown(aimKey) then
-        local target = getNearestEnemy()
-        if target and target.Character then
-            local hrp2 = target.Character:FindFirstChild("HumanoidRootPart")
-                      or target.Character:FindFirstChild("Head")
-            if hrp2 then
-                Camera.CFrame = CFrame.new(Camera.CFrame.Position, hrp2.Position)
+local aimKeyCode = Enum.KeyCode[S.aimKey] or Enum.KeyCode.E
+RunService.RenderStepped:Connect(function(dt)
+    if S.aimbot and UserInputService:IsKeyDown(aimKeyCode) then
+        local target = getNearestEnemy(false)
+        if target then
+            local c = charOfPlayer(target)
+            local head = c and (c:FindFirstChild("Head") or c:FindFirstChild("HumanoidRootPart"))
+            if head then
+                local desired = CFrame.new(Camera.CFrame.Position, head.Position)
+                local smooth  = math.clamp(S.aimSmooth, 0.05, 1)
+                Camera.CFrame = Camera.CFrame:Lerp(desired, smooth)
             end
         end
     end
 end)
 
--- Silent Aim: хук на Mouse.Hit / Mouse.Target когда инструмент ищет цель
-local origMetatable
-local function enableSilentAim()
-    if origMetatable then return end
-    local mt = getrawmetatable and getrawmetatable(game)
+-- Silent Aim: подменяем Mouse.Hit / Mouse.Target
+local silentAimInstalled = false
+local function installSilentAim()
+    if silentAimInstalled then return end
+    if not _getrawmt then
+        notify("CENTAURA", "Silent Aim: executor без getrawmetatable", 4); return
+    end
+    local mt = _getrawmt(game)
     if not mt then return end
+    pcall(function() if _setreadonly then _setreadonly(mt, false) end end)
     local oldIndex = mt.__index
-    pcall(function()
-        if setreadonly then setreadonly(mt, false) end
-    end)
-    origMetatable = oldIndex
     mt.__index = function(self, k)
         if S.silentAim and (self == LP or self == Mouse) then
             if k == "Hit" or k == "hit" then
-                local target = getNearestEnemy()
-                if target and target.Character then
-                    local part = target.Character:FindFirstChild("Head")
-                              or target.Character:FindFirstChild("HumanoidRootPart")
-                    if part then return CFrame.new(part.Position) end
+                local target = getNearestEnemy(false)
+                if target then
+                    local c = charOfPlayer(target)
+                    local p = c and (c:FindFirstChild("Head") or c:FindFirstChild("HumanoidRootPart"))
+                    if p then return CFrame.new(p.Position) end
                 end
             elseif k == "Target" or k == "target" then
-                local target = getNearestEnemy()
-                if target and target.Character then
-                    return target.Character:FindFirstChild("Head")
-                        or target.Character:FindFirstChild("HumanoidRootPart")
+                local target = getNearestEnemy(false)
+                if target then
+                    local c = charOfPlayer(target)
+                    return c and (c:FindFirstChild("Head") or c:FindFirstChild("HumanoidRootPart"))
                 end
             end
         end
         return oldIndex(self, k)
     end
-    pcall(function()
-        if setreadonly then setreadonly(mt, true) end
-    end)
+    pcall(function() if _setreadonly then _setreadonly(mt, true) end end)
+    silentAimInstalled = true
 end
--- не активируем хук пока юзер не включит silentAim; включение — при первом переключении
-local silentAimInitialized = false
-local function setSilentAim(on)
-    if on and not silentAimInitialized then
-        silentAimInitialized = true
-        enableSilentAim()
-    end
-end
+local function setSilentAim(on) if on then installSilentAim() end end
 
--- ===== Kill Aura (knife swing at nearby players) =====
--- Активирует Tool (knife) если рядом есть цель — работает только когда игрок Murderer.
+-- ========================================================
+-- Kill Aura
+-- ========================================================
 task.spawn(function()
-    while task.wait(0.1) do
+    while task.wait(0.12) do
         if S.killAura then
-            local c = char(); if c then
-                local myRoot = c:FindFirstChild("HumanoidRootPart")
+            local c = getActiveCharacter()
+            if c then
+                local root = c:FindFirstChild("HumanoidRootPart")
                 local knife
                 for _, t in ipairs(c:GetChildren()) do
-                    if t:IsA("Tool") and string.lower(t.Name):find("knife") then knife = t end
+                    if t:IsA("Tool") and string.lower(t.Name):find("knife") then knife = t; break end
                 end
-                if myRoot and knife then
+                if root and knife then
                     for _, pl in ipairs(Players:GetPlayers()) do
-                        if pl ~= LP and pl.Character then
-                            local hrp2 = pl.Character:FindFirstChild("HumanoidRootPart")
-                            local hum2 = pl.Character:FindFirstChildOfClass("Humanoid")
-                            if hrp2 and hum2 and hum2.Health > 0 then
-                                if (hrp2.Position - myRoot.Position).Magnitude < S.auraRange then
+                        if pl ~= LP then
+                            local ec = charOfPlayer(pl)
+                            if ec and isAlive(ec) then
+                                local er = ec:FindFirstChild("HumanoidRootPart")
+                                if er and (er.Position - root.Position).Magnitude < S.auraRange then
                                     pcall(function() knife:Activate() end)
                                 end
                             end
@@ -356,20 +391,35 @@ task.spawn(function()
     end
 end)
 
--- ===== Trigger Bot (auto-fire when enemy under crosshair) =====
+-- ========================================================
+-- Trigger Bot (raycast wall check)
+-- ========================================================
 task.spawn(function()
-    while task.wait(0.05) do
+    while task.wait(0.04) do
         if S.triggerBot then
-            local mpos = UserInputService:GetMouseLocation()
-            local target = getNearestEnemy()
-            if target and target.Character then
-                local hrp2 = target.Character:FindFirstChild("HumanoidRootPart")
-                if hrp2 then
-                    local v = Camera:WorldToViewportPoint(hrp2.Position)
-                    local d = (Vector2.new(v.X, v.Y) - mpos).Magnitude
-                    if d < 25 then
-                        VirtualInputManager:SendMouseButtonEvent(mpos.X, mpos.Y, 0, true, game, 0); task.wait(0.03)
-                        VirtualInputManager:SendMouseButtonEvent(mpos.X, mpos.Y, 0, false, game, 0)
+            local target = getNearestEnemy(S.tbWallCheck)
+            if target then
+                local c = charOfPlayer(target)
+                local head = c and (c:FindFirstChild("Head") or c:FindFirstChild("HumanoidRootPart"))
+                if head then
+                    local v = Camera:WorldToViewportPoint(head.Position)
+                    local mp = UserInputService:GetMouseLocation()
+                    local d = (Vector2.new(v.X, v.Y) - mp).Magnitude
+                    if d < S.tbRadius then
+                        -- проверка что курсор реально на враге (Mouse.Target)
+                        local t = Mouse.Target
+                        local onEnemy = false
+                        if t and c and t:IsDescendantOf(c) then onEnemy = true end
+                        -- либо курсор достаточно близко (d < tbRadius) + LOS
+                        if onEnemy or (not S.tbWallCheck) or hasLineOfSight(head) then
+                            local mx, my = mp.X, mp.Y
+                            pcall(function()
+                                VirtualInputManager:SendMouseButtonEvent(mx, my, 0, true, game, 0)
+                                task.wait(0.03)
+                                VirtualInputManager:SendMouseButtonEvent(mx, my, 0, false, game, 0)
+                            end)
+                            task.wait(0.15) -- кулдаун чтобы не спамить
+                        end
                     end
                 end
             end
@@ -377,135 +427,144 @@ task.spawn(function()
     end
 end)
 
--- ===== ESP =====
-local espStore = {}
-local function clearESPFor(pl)
-    local e = espStore[pl]; if not e then return end
-    for _, obj in pairs(e) do pcall(function() obj:Destroy() end) end
-    espStore[pl] = nil
-end
-local function ensureESPFor(pl)
-    if pl == LP then return nil end
-    if not pl.Character then return nil end
-    if not espStore[pl] then espStore[pl] = {} end
-    local e = espStore[pl]
-    local head = pl.Character:FindFirstChild("Head")
-    local hrp2 = pl.Character:FindFirstChild("HumanoidRootPart")
-    if not head or not hrp2 then return e end
-
-    if S.espNames or S.espBox then
-        if not e.bb then
-            local bb = Instance.new("BillboardGui", pl.Character)
-            bb.Name = "_CENTAURA_ESP"
-            bb.Adornee = head
-            bb.Size = UDim2.new(0, 140, 0, 28)
-            bb.StudsOffset = Vector3.new(0, 2.5, 0)
-            bb.AlwaysOnTop = true
-            local lbl = Instance.new("TextLabel", bb)
-            lbl.BackgroundTransparency = 1
-            lbl.Size = UDim2.new(1, 0, 1, 0)
-            lbl.Font = Enum.Font.GothamBold
-            lbl.TextSize = 13
-            lbl.TextStrokeTransparency = 0.3
-            lbl.TextColor3 = Color3.fromRGB(255,255,255)
-            e.bb = bb; e.lbl = lbl
-        end
-    end
-    if e.bb and not (S.espNames or S.espBox) then
-        e.bb:Destroy(); e.bb = nil; e.lbl = nil
-    end
-
-    if S.teamChams or S.espBox then
-        if not e.hl then
-            local hl = Instance.new("Highlight", pl.Character)
-            hl.Name = "_CENTAURA_HL"
-            hl.FillTransparency = 0.55
-            hl.OutlineColor = Color3.fromRGB(255,255,255)
-            e.hl = hl
-        end
-    end
-    if e.hl and not (S.teamChams or S.espBox) then
-        e.hl:Destroy(); e.hl = nil
-    end
-
-    if S.espTracers then
-        if not e.line then
-            local line = Drawing and Drawing.new and Drawing.new("Line")
-            if line then
-                line.Thickness = 1.5
-                line.Transparency = 1
-                e.line = line
-            end
-        end
-    end
-    if e.line and not S.espTracers then
-        pcall(function() e.line:Remove() end)
-        e.line = nil
-    end
-
-    return e
-end
-
-local function roleOfPlayer(pl)
-    if not pl.Character then return "Innocent" end
-    local hasKnife, hasGun = false, false
-    local function scan(container)
-        if not container then return end
-        for _, t in ipairs(container:GetChildren()) do
-            if t:IsA("Tool") or t:IsA("Model") then
-                local n = string.lower(t.Name or "")
-                if n:find("knife") or n:find("blade") then hasKnife = true
-                elseif n:find("gun") or n:find("revolver") or n:find("pistol") or n:find("rifle") then hasGun = true end
-            end
-        end
-    end
-    scan(pl.Character)
-    scan(pl:FindFirstChild("Backpack"))
-    if hasKnife then return "Murderer" end
-    if hasGun then return "Sheriff" end
-    return "Innocent"
-end
-
+-- ========================================================
+-- ESP (Heartbeat 0.1s, cached objects)
+-- ========================================================
+local espStore = {} -- [player] = {bb, lbl, hl, line}
 local function roleColor(role)
-    if role == "Murderer" then return Color3.fromRGB(255, 50, 60) end
+    if role == "Murderer" then return Color3.fromRGB(255, 55, 60) end
     if role == "Sheriff"  then return Color3.fromRGB(60, 130, 255) end
+    if role == "Both"     then return Color3.fromRGB(255, 180, 40) end
     return Color3.fromRGB(220, 220, 220)
 end
 
-RunService.RenderStepped:Connect(function()
-    local anyESP = S.espNames or S.espBox or S.espTracers or S.teamChams
-    for _, pl in ipairs(Players:GetPlayers()) do
-        if pl ~= LP then
-            if not anyESP then
-                clearESPFor(pl)
-            else
-                local e = ensureESPFor(pl)
-                if e then
-                    local role = roleOfPlayer(pl)
-                    local col  = roleColor(role)
-                    if e.lbl then
-                        e.lbl.TextColor3 = col
-                        e.lbl.Text = S.espNames and (pl.Name .. " · " .. role) or role
-                    end
-                    if e.hl then
-                        e.hl.FillColor = col
-                        e.hl.OutlineColor = col
-                    end
-                    if e.line then
-                        local hrp2 = pl.Character and pl.Character:FindFirstChild("HumanoidRootPart")
-                        if hrp2 then
-                            local v, on = Camera:WorldToViewportPoint(hrp2.Position)
-                            if on then
-                                local mp = UserInputService:GetMouseLocation()
-                                e.line.From = Vector2.new(mp.X, mp.Y + 30)
-                                e.line.To = Vector2.new(v.X, v.Y)
-                                e.line.Color = col
-                                e.line.Visible = true
-                            else
-                                e.line.Visible = false
+local function cleanupDrawing(obj)
+    if not obj then return end
+    pcall(function() obj:Remove() end)
+end
+
+local function clearESPFor(pl)
+    local e = espStore[pl]; if not e then return end
+    if e.bb then pcall(function() e.bb:Destroy() end) end
+    if e.hl then pcall(function() e.hl:Destroy() end) end
+    cleanupDrawing(e.line)
+    espStore[pl] = nil
+end
+
+local function ensureLabel(pl, c)
+    local e = espStore[pl]
+    local head = c:FindFirstChild("Head") or c:FindFirstChild("HumanoidRootPart")
+    if not head then return end
+    if not e.bb then
+        local bb = Instance.new("BillboardGui")
+        bb.Name = "_CENTAURA_ESP"
+        bb.Size = UDim2.new(0, 160, 0, 24)
+        bb.StudsOffset = Vector3.new(0, 2.5, 0)
+        bb.AlwaysOnTop = true
+        bb.Parent = c
+        bb.Adornee = head
+        local lbl = Instance.new("TextLabel", bb)
+        lbl.BackgroundTransparency = 1
+        lbl.Size = UDim2.new(1, 0, 1, 0)
+        lbl.Font = Enum.Font.GothamBold
+        lbl.TextSize = 13
+        lbl.TextStrokeTransparency = 0.3
+        e.bb = bb; e.lbl = lbl
+    else
+        if e.bb.Adornee ~= head then e.bb.Adornee = head end
+    end
+end
+local function ensureHL(pl, c)
+    local e = espStore[pl]
+    if not e.hl then
+        local hl = Instance.new("Highlight")
+        hl.Name = "_CENTAURA_HL"
+        hl.FillTransparency = 0.55
+        hl.OutlineColor = Color3.fromRGB(255,255,255)
+        hl.Parent = c
+        hl.Adornee = c
+        e.hl = hl
+    end
+end
+local function ensureTracer(pl)
+    local e = espStore[pl]
+    if not e.line and Drawing and Drawing.new then
+        local ok, line = pcall(function() return Drawing.new("Line") end)
+        if ok and line then
+            line.Thickness = 1.5
+            line.Transparency = 1
+            e.line = line
+        end
+    end
+end
+
+RunService.Heartbeat:Connect(function()
+    -- throttle ~ 10 Hz
+end)
+local lastEsp = 0
+task.spawn(function()
+    while task.wait(0.1) do
+        local anyESP = S.espNames or S.espBox or S.espTracers or S.teamChams
+        for _, pl in ipairs(Players:GetPlayers()) do
+            if pl ~= LP then
+                if not anyESP then
+                    clearESPFor(pl)
+                else
+                    espStore[pl] = espStore[pl] or {}
+                    local c = charOfPlayer(pl)
+                    if not c or not isAlive(c) then
+                        clearESPFor(pl)
+                    else
+                        local role = computeRoleFor(pl)
+                        local col  = roleColor(role)
+                        -- label
+                        if S.espNames then
+                            ensureLabel(pl, c)
+                            local e = espStore[pl]
+                            if e.lbl then
+                                e.lbl.TextColor3 = col
+                                e.lbl.Text = string.format("%s · %s", pl.Name, role)
                             end
-                        else
-                            e.line.Visible = false
+                        elseif espStore[pl].bb then
+                            pcall(function() espStore[pl].bb:Destroy() end)
+                            espStore[pl].bb = nil; espStore[pl].lbl = nil
+                        end
+                        -- highlight
+                        if S.teamChams or S.espBox then
+                            ensureHL(pl, c)
+                            local e = espStore[pl]
+                            if e.hl then
+                                e.hl.FillColor = col
+                                e.hl.OutlineColor = col
+                            end
+                        elseif espStore[pl].hl then
+                            pcall(function() espStore[pl].hl:Destroy() end)
+                            espStore[pl].hl = nil
+                        end
+                        -- tracer
+                        if S.espTracers then
+                            ensureTracer(pl)
+                            local e = espStore[pl]
+                            if e.line then
+                                local head = c:FindFirstChild("HumanoidRootPart") or c:FindFirstChild("Head")
+                                if head then
+                                    local v, on = Camera:WorldToViewportPoint(head.Position)
+                                    if on and v.Z > 0 then
+                                        local vs = Camera.ViewportSize
+                                        e.line.From = Vector2.new(vs.X/2, vs.Y)
+                                        e.line.To   = Vector2.new(v.X, v.Y)
+                                        e.line.Color = col
+                                        e.line.Visible = true
+                                    else
+                                        e.line.Visible = false
+                                    end
+                                else
+                                    e.line.Visible = false
+                                end
+                            end
+                        elseif espStore[pl].line then
+                            cleanupDrawing(espStore[pl].line)
+                            espStore[pl].line = nil
                         end
                     end
                 end
@@ -515,9 +574,11 @@ RunService.RenderStepped:Connect(function()
 end)
 Players.PlayerRemoving:Connect(clearESPFor)
 
--- ===== Automation =====
--- Auto-click case button (pattern: "case" / "open" / "unlock")
-local function clickButtonsMatching(patterns)
+-- ========================================================
+-- Automation
+-- ========================================================
+local CENTAURA_GUI -- forward
+local function clickGUIMatching(patterns)
     local pg = LP:FindFirstChild("PlayerGui"); if not pg then return end
     for _, g in ipairs(pg:GetDescendants()) do
         if (g:IsA("TextButton") or g:IsA("ImageButton"))
@@ -542,28 +603,24 @@ local function clickButtonsMatching(patterns)
         end
     end
 end
--- forward ref
-CENTAURA_GUI = nil
 
 task.spawn(function()
-    while task.wait(0.6) do
-        if S.autoCase then clickButtonsMatching({"openc","case","unlock","opencase"}) end
+    while task.wait(0.8) do
+        if S.autoCase then clickGUIMatching({"opencase","unlock","^case$","open case"}) end
     end
 end)
-
--- Auto Respawn (hook died)
 task.spawn(function()
     while task.wait(1) do
         if S.autoRespawn then
-            local _, hum = hrp()
-            if hum and hum.Health <= 0 then
-                pcall(function() LP:LoadCharacter() end)
-            end
+            local _, hum = getHRP()
+            if hum and hum.Health <= 0 then pcall(function() LP:LoadCharacter() end) end
         end
     end
 end)
 
--- ===== GUI (tabbed) =====
+-- ========================================================
+-- GUI (tabbed)
+-- ========================================================
 local pg = LP:WaitForChild("PlayerGui")
 if pg:FindFirstChild("CENTAURA_MVS") then pg.CENTAURA_MVS:Destroy() end
 
@@ -575,8 +632,8 @@ gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 CENTAURA_GUI = gui
 
 local root = Instance.new("Frame", gui)
-root.Size             = UDim2.new(0, 460, 0, 360)
-root.Position         = UDim2.new(0.5, -230, 0.5, -180)
+root.Size             = UDim2.new(0, 480, 0, 380)
+root.Position         = UDim2.new(0.5, -240, 0.5, -190)
 root.BackgroundColor3 = Color3.fromRGB(14, 14, 20)
 root.BorderSizePixel  = 0
 root.Active           = true
@@ -585,7 +642,6 @@ Instance.new("UICorner", root).CornerRadius = UDim.new(0, 10)
 local stroke = Instance.new("UIStroke", root)
 stroke.Color = Color3.fromRGB(150, 80, 255); stroke.Thickness = 1.6
 
--- Header
 local header = Instance.new("Frame", root)
 header.Size             = UDim2.new(1, 0, 0, 42)
 header.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
@@ -600,7 +656,7 @@ title.TextXAlignment = Enum.TextXAlignment.Left
 title.Font = Enum.Font.GothamBold
 title.TextSize = 15
 title.TextColor3 = Color3.fromRGB(220, 200, 255)
-title.Text = "CENTAURA · Murderers vs Sheriffs 2"
+title.Text = "CENTAURA · Murderers vs Sheriffs 2  v2"
 
 local sub = Instance.new("TextLabel", header)
 sub.Position = UDim2.new(0, 16, 0, 22)
@@ -612,7 +668,6 @@ sub.TextSize = 11
 sub.TextColor3 = Color3.fromRGB(160, 140, 210)
 sub.Text = "By @zood3llotgk"
 
--- Tab bar
 local tabBar = Instance.new("Frame", root)
 tabBar.Position          = UDim2.new(0, 8, 0, 48)
 tabBar.Size              = UDim2.new(0, 120, 1, -56)
@@ -620,12 +675,10 @@ tabBar.BackgroundColor3  = Color3.fromRGB(20, 20, 28)
 tabBar.BorderSizePixel   = 0
 Instance.new("UICorner", tabBar).CornerRadius = UDim.new(0, 8)
 local tabLay = Instance.new("UIListLayout", tabBar)
-tabLay.Padding = UDim.new(0, 4)
-tabLay.SortOrder = Enum.SortOrder.LayoutOrder
+tabLay.Padding = UDim.new(0, 4); tabLay.SortOrder = Enum.SortOrder.LayoutOrder
 local tabPad = Instance.new("UIPadding", tabBar)
 tabPad.PaddingTop = UDim.new(0, 6); tabPad.PaddingLeft = UDim.new(0, 6); tabPad.PaddingRight = UDim.new(0, 6)
 
--- Content pane
 local content = Instance.new("Frame", root)
 content.Position = UDim2.new(0, 136, 0, 48)
 content.Size = UDim2.new(1, -144, 1, -56)
@@ -633,58 +686,41 @@ content.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
 content.BorderSizePixel = 0
 Instance.new("UICorner", content).CornerRadius = UDim.new(0, 8)
 
-local tabFrames = {}
-local tabButtons = {}
-local activeTab
-
+local tabFrames, tabButtons = {}, {}
 local function selectTab(name)
-    activeTab = name
     for n, f in pairs(tabFrames) do f.Visible = (n == name) end
     for n, b in pairs(tabButtons) do
         b.BackgroundColor3 = (n == name) and Color3.fromRGB(70, 30, 130) or Color3.fromRGB(30, 30, 40)
     end
 end
-
 local function addTab(name, order)
     local btn = Instance.new("TextButton", tabBar)
-    btn.Size = UDim2.new(1, 0, 0, 28)
-    btn.LayoutOrder = order
-    btn.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
-    btn.BorderSizePixel = 0
-    btn.Font = Enum.Font.GothamMedium
-    btn.TextSize = 12
-    btn.TextColor3 = Color3.fromRGB(230, 230, 240)
-    btn.Text = name
+    btn.Size = UDim2.new(1, 0, 0, 28); btn.LayoutOrder = order
+    btn.BackgroundColor3 = Color3.fromRGB(30, 30, 40); btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamMedium; btn.TextSize = 12
+    btn.TextColor3 = Color3.fromRGB(230, 230, 240); btn.Text = name
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 5)
     tabButtons[name] = btn
 
     local frame = Instance.new("ScrollingFrame", content)
-    frame.Size = UDim2.new(1, -12, 1, -12)
-    frame.Position = UDim2.new(0, 6, 0, 6)
-    frame.BackgroundTransparency = 1
-    frame.BorderSizePixel = 0
-    frame.CanvasSize = UDim2.new(0, 0, 0, 0)
-    frame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    frame.Size = UDim2.new(1, -12, 1, -12); frame.Position = UDim2.new(0, 6, 0, 6)
+    frame.BackgroundTransparency = 1; frame.BorderSizePixel = 0
+    frame.CanvasSize = UDim2.new(0, 0, 0, 0); frame.AutomaticCanvasSize = Enum.AutomaticSize.Y
     frame.ScrollBarThickness = 4
     frame.ScrollBarImageColor3 = Color3.fromRGB(150, 80, 255)
     frame.Visible = false
     local lay = Instance.new("UIListLayout", frame); lay.Padding = UDim.new(0, 5)
     tabFrames[name] = frame
-
     btn.MouseButton1Click:Connect(function() selectTab(name) end)
     return frame
 end
-
 local function toggle(parent, name, key, accent, onToggle)
     local b = Instance.new("TextButton", parent)
-    b.Size = UDim2.new(1, -4, 0, 28)
-    b.BorderSizePixel = 0
-    b.Font = Enum.Font.GothamMedium
-    b.TextSize = 12
+    b.Size = UDim2.new(1, -4, 0, 28); b.BorderSizePixel = 0
+    b.Font = Enum.Font.GothamMedium; b.TextSize = 12
     b.TextColor3 = Color3.fromRGB(240, 240, 245)
     Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
-    local onC = accent or Color3.fromRGB(70, 30, 130)
-    local offC = Color3.fromRGB(28, 28, 36)
+    local onC = accent or Color3.fromRGB(70, 30, 130); local offC = Color3.fromRGB(28, 28, 36)
     local function r()
         b.Text = (S[key] and "[ ON  ]  " or "[ OFF ]  ") .. name
         b.BackgroundColor3 = S[key] and onC or offC
@@ -696,12 +732,10 @@ local function toggle(parent, name, key, accent, onToggle)
         if onToggle then pcall(onToggle, S[key]) end
     end)
 end
-
 local function slider(parent, label, key, mn, mx, step)
     local c = Instance.new("Frame", parent)
     c.Size = UDim2.new(1, -4, 0, 40)
-    c.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
-    c.BorderSizePixel = 0
+    c.BackgroundColor3 = Color3.fromRGB(28, 28, 36); c.BorderSizePixel = 0
     Instance.new("UICorner", c).CornerRadius = UDim.new(0, 6)
     local l = Instance.new("TextLabel", c)
     l.Size = UDim2.new(1, -10, 0, 14); l.Position = UDim2.new(0, 8, 0, 2)
@@ -724,43 +758,40 @@ local function slider(parent, label, key, mn, mx, step)
     v.Size = UDim2.new(1, -72, 0, 20); v.Position = UDim2.new(0, 36, 0, 18)
     v.BackgroundTransparency = 1; v.Font = Enum.Font.GothamMedium; v.TextSize = 12
     v.TextColor3 = Color3.fromRGB(240, 240, 245); v.Text = tostring(S[key])
-    local function ap(x) x = math.clamp(x, mn, mx); S[key] = x; v.Text = tostring(x); l.Text = label .. ": " .. tostring(x) end
+    local function ap(x)
+        if step < 1 then x = math.floor(x * 100 + 0.5) / 100 end
+        x = math.clamp(x, mn, mx); S[key] = x; v.Text = tostring(x); l.Text = label .. ": " .. tostring(x)
+    end
     m.MouseButton1Click:Connect(function() ap(S[key] - step) end)
     p.MouseButton1Click:Connect(function() ap(S[key] + step) end)
 end
-
 local function infoRow(parent, getText)
     local l = Instance.new("TextLabel", parent)
     l.Size = UDim2.new(1, -4, 0, 24)
-    l.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
-    l.BorderSizePixel = 0
+    l.BackgroundColor3 = Color3.fromRGB(28, 28, 36); l.BorderSizePixel = 0
     l.Font = Enum.Font.GothamMedium; l.TextSize = 12
     l.TextColor3 = Color3.fromRGB(220, 220, 230)
     l.Text = getText()
     Instance.new("UICorner", l).CornerRadius = UDim.new(0, 5)
     task.spawn(function()
-        while l.Parent do
-            l.Text = getText()
-            task.wait(0.4)
-        end
+        while l.Parent do l.Text = getText(); task.wait(0.4) end
     end)
 end
 
--- ===== Tabs =====
-local tabPlayer     = addTab("Player", 1)
-local tabCombat     = addTab("Combat", 2)
-local tabVisuals    = addTab("Visuals", 3)
-local tabAutomation = addTab("Automation", 4)
-local tabInfo       = addTab("Info", 5)
-local tabMisc       = addTab("Misc", 6)
+local tabPlayer  = addTab("Player", 1)
+local tabCombat  = addTab("Combat", 2)
+local tabVisuals = addTab("Visuals", 3)
+local tabAuto    = addTab("Automation", 4)
+local tabInfo    = addTab("Info", 5)
+local tabMisc    = addTab("Misc", 6)
 
 -- Player
 toggle(tabPlayer, "Speed Hack",    "speedHack", Color3.fromRGB(30, 140, 80), function(on)
-    local _, hum = hrp(); if hum and on then hum.WalkSpeed = S.walkSpeed end
+    local _, hum = getHRP(); if hum and on then pcall(function() hum.WalkSpeed = S.walkSpeed end) end
 end)
 slider(tabPlayer, "Walk Speed",    "walkSpeed", 16, 300, 4)
 toggle(tabPlayer, "Jump Hack",     "jumpHack", Color3.fromRGB(30, 90, 180), function(on)
-    local _, hum = hrp(); if hum and on then hum.JumpPower = S.jumpPower; hum.UseJumpPower = true end
+    local _, hum = getHRP(); if hum and on then pcall(function() hum.JumpPower = S.jumpPower; hum.UseJumpPower = true end) end
 end)
 slider(tabPlayer, "Jump Power",    "jumpPower", 50, 500, 10)
 toggle(tabPlayer, "Infinite Jump", "infJump")
@@ -772,10 +803,13 @@ toggle(tabPlayer, "Anti-AFK",      "antiAFK")
 -- Combat
 toggle(tabCombat, "Silent Aim",    "silentAim", Color3.fromRGB(180, 50, 50), setSilentAim)
 toggle(tabCombat, "Aimbot (hold E)", "aimbot", Color3.fromRGB(200, 70, 50))
-slider(tabCombat, "FOV",           "fov", 20, 500, 10)
+slider(tabCombat, "Aimbot FOV",    "fov", 20, 600, 10)
+slider(tabCombat, "Aim Smooth",    "aimSmooth", 0.05, 1, 0.05)
+toggle(tabCombat, "Trigger Bot",   "triggerBot", Color3.fromRGB(140, 80, 30))
+toggle(tabCombat, "TB Wall Check", "tbWallCheck", Color3.fromRGB(60, 90, 180))
+slider(tabCombat, "TB Radius",     "tbRadius", 6, 60, 2)
 toggle(tabCombat, "Kill Aura (knife)", "killAura", Color3.fromRGB(160, 40, 60))
 slider(tabCombat, "Aura Range",    "auraRange", 4, 30, 1)
-toggle(tabCombat, "Trigger Bot",   "triggerBot", Color3.fromRGB(140, 80, 30))
 
 -- Visuals
 toggle(tabVisuals, "ESP Names",    "espNames", Color3.fromRGB(80, 130, 200))
@@ -784,8 +818,8 @@ toggle(tabVisuals, "ESP Tracers",  "espTracers", Color3.fromRGB(80, 130, 200))
 toggle(tabVisuals, "Team Chams",   "teamChams", Color3.fromRGB(150, 80, 255))
 
 -- Automation
-toggle(tabAutomation, "Auto Open Case", "autoCase", Color3.fromRGB(140, 100, 30))
-toggle(tabAutomation, "Auto Respawn",   "autoRespawn")
+toggle(tabAuto, "Auto Open Case", "autoCase", Color3.fromRGB(140, 100, 30))
+toggle(tabAuto, "Auto Respawn",   "autoRespawn")
 
 -- Info
 infoRow(tabInfo, function() return "Role: " .. (S.role or "?") end)
@@ -793,6 +827,10 @@ infoRow(tabInfo, function() return "Kill Streak: " .. tostring(S.streak or 0) en
 infoRow(tabInfo, function() return "Coins (?): " .. tostring(S.coins or 0) end)
 infoRow(tabInfo, function() return "Last killed by: " .. tostring(S.lastKilledBy or "-") end)
 infoRow(tabInfo, function() return "Players: " .. tostring(#Players:GetPlayers()) end)
+infoRow(tabInfo, function()
+    local c = getActiveCharacter()
+    return "Active char: " .. (c and c:GetFullName() or "nil")
+end)
 
 -- Misc
 local hint = Instance.new("TextLabel", tabMisc)
@@ -807,11 +845,13 @@ destroyBtn.Size = UDim2.new(1, -4, 0, 28)
 destroyBtn.BackgroundColor3 = Color3.fromRGB(120, 30, 30)
 destroyBtn.BorderSizePixel = 0
 destroyBtn.TextColor3 = Color3.fromRGB(255,255,255)
-destroyBtn.Font = Enum.Font.GothamBold
-destroyBtn.TextSize = 12
+destroyBtn.Font = Enum.Font.GothamBold; destroyBtn.TextSize = 12
 destroyBtn.Text = "Unload CENTAURA"
 Instance.new("UICorner", destroyBtn).CornerRadius = UDim.new(0, 6)
-destroyBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
+destroyBtn.MouseButton1Click:Connect(function()
+    for pl, _ in pairs(espStore) do clearESPFor(pl) end
+    gui:Destroy()
+end)
 
 UserInputService.InputBegan:Connect(function(i, gpe)
     if gpe then return end
@@ -819,4 +859,4 @@ UserInputService.InputBegan:Connect(function(i, gpe)
 end)
 
 selectTab("Player")
-notify("CENTAURA", "MvS2 v1 loaded · by @zood3llotgk", 4)
+notify("CENTAURA", "MvS2 v2 loaded · by @zood3llotgk", 4)
