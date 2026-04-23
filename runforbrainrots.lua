@@ -240,10 +240,14 @@ local function fireButton(btn)
     end)
 end
 
+-- forward ref — присваивается ниже при создании ScreenGui
+local CENTAURA_GUI = nil
+
 local function clickButtonsMatching(patterns)
     local pg = LP:FindFirstChild("PlayerGui"); if not pg then return end
     for _, g in ipairs(pg:GetDescendants()) do
-        if g:IsA("TextButton") or g:IsA("ImageButton") then
+        if (g:IsA("TextButton") or g:IsA("ImageButton"))
+           and not (CENTAURA_GUI and g:IsDescendantOf(CENTAURA_GUI)) then
             if g.Visible and g.Active and g.AbsoluteSize.X > 0 then
                 local name = string.lower(g.Name or "")
                 local text = (g:IsA("TextButton") and string.lower(g.Text or "")) or ""
@@ -369,6 +373,7 @@ gui.Name           = "CENTAURA_RFB"
 gui.ResetOnSpawn   = false
 gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+CENTAURA_GUI = gui  -- чтобы clickButtonsMatching не жал свои же тоглы
 
 local frame = Instance.new("Frame", gui)
 frame.Size             = UDim2.new(0, 300, 0, 500)

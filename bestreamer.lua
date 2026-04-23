@@ -74,15 +74,13 @@ end)
 task.spawn(function()
     while true do
         if S.infMode and StreamingEvent then
-            pcall(function()
-                StreamingEvent:FireServer("startStream")
-                local n = math.max(1, math.floor(S.segmentsPerCycle))
-                for i = 1, n do
-                    StreamingEvent:FireServer("segmentStreamed")
-                end
-                StreamingEvent:FireServer("endStream")
-                if MailBox then MailBox:FireServer() end
-            end)
+            pcall(function() StreamingEvent:FireServer("startStream") end)
+            local n = math.max(1, math.floor(S.segmentsPerCycle))
+            for i = 1, n do
+                pcall(function() StreamingEvent:FireServer("segmentStreamed") end)
+            end
+            pcall(function() StreamingEvent:FireServer("endStream") end)
+            if MailBox then pcall(function() MailBox:FireServer() end) end
             task.wait(S.cycleDelay)
         else
             task.wait(0.1)
