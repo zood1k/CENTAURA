@@ -38,7 +38,7 @@ local S = {
     antiAFK      = true,
 
     silentAim    = false,
-    aimbot       = false, aimKey = "E", fov = 100, aimSmooth = 0.35,
+    aimbot       = false, aimKey = "E", fov = 120, aimSmooth = 1, aimTarget = "HumanoidRootPart",
     killAura     = false, auraRange = 12,
     triggerBot   = false, tbWallCheck = true, tbRadius = 18,
 
@@ -310,18 +310,22 @@ local function getNearestEnemy(requireLOS)
 end
 
 local aimKeyCode = Enum.KeyCode[S.aimKey] or Enum.KeyCode.E
-RunService.RenderStepped:Connect(function(dt)
-    if S.aimbot and UserInputService:IsKeyDown(aimKeyCode) then
-        local target = getNearestEnemy(false)
-        if target then
-            local c = charOfPlayer(target)
-            local head = c and (c:FindFirstChild("Head") or c:FindFirstChild("HumanoidRootPart"))
-            if head then
-                local desired = CFrame.new(Camera.CFrame.Position, head.Position)
-                local smooth  = math.clamp(S.aimSmooth, 0.05, 1)
-                Camera.CFrame = Camera.CFrame:Lerp(desired, smooth)
-            end
-        end
+-- Aimbot: целится в HumanoidRootPart (дефолт — стабильнее чем Head), строит CFrame через
+-- lookAt с Vector3.yAxis (никакого roll-а — камера не "кривится"). Default smooth = 1 (snap).
+RunService.RenderStepped:Connect(function()
+    if not (S.aimbot and UserInputService:IsKeyDown(aimKeyCode)) then return end
+    local target = getNearestEnemy(false)
+    if not target then return end
+    local c = charOfPlayer(target); if not c then return end
+    local part = c:FindFirstChild(S.aimTarget) or c:FindFirstChild("HumanoidRootPart") or c:FindFirstChild("Head")
+    if not part then return end
+    local origin = Camera.CFrame.Position
+    local desired = CFrame.lookAt(origin, part.Position, Vector3.yAxis)
+    local smooth = math.clamp(S.aimSmooth, 0.05, 1)
+    if smooth >= 0.999 then
+        Camera.CFrame = desired
+    else
+        Camera.CFrame = Camera.CFrame:Lerp(desired, smooth)
     end
 end)
 
@@ -498,10 +502,6 @@ local function ensureTracer(pl)
     end
 end
 
-RunService.Heartbeat:Connect(function()
-    -- throttle ~ 10 Hz
-end)
-local lastEsp = 0
 task.spawn(function()
     while task.wait(0.1) do
         local anyESP = S.espNames or S.espBox or S.espTracers or S.teamChams
@@ -803,8 +803,22 @@ toggle(tabPlayer, "Anti-AFK",      "antiAFK")
 -- Combat
 toggle(tabCombat, "Silent Aim",    "silentAim", Color3.fromRGB(180, 50, 50), setSilentAim)
 toggle(tabCombat, "Aimbot (hold E)", "aimbot", Color3.fromRGB(200, 70, 50))
-slider(tabCombat, "Aimbot FOV",    "fov", 20, 600, 10)
+slider(tabCombat, "Aimbot FOV",    "fov", 20, 800, 20)
 slider(tabCombat, "Aim Smooth",    "aimSmooth", 0.05, 1, 0.05)
+-- aimTarget toggle: Head vs HRP
+do
+    local b = Instance.new("TextButton", tabCombat)
+    b.Size = UDim2.new(1, -4, 0, 28); b.BorderSizePixel = 0
+    b.Font = Enum.Font.GothamMedium; b.TextSize = 12
+    b.TextColor3 = Color3.fromRGB(240, 240, 245)
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    local function r() b.Text = "Aim Target: " .. S.aimTarget; b.BackgroundColor3 = Color3.fromRGB(50, 50, 70) end
+    r()
+    b.MouseButton1Click:Connect(function()
+        S.aimTarget = (S.aimTarget == "Head") and "HumanoidRootPart" or "Head"; r()
+        notify("CENTAURA", "Aim Target: " .. S.aimTarget)
+    end)
+end
 toggle(tabCombat, "Trigger Bot",   "triggerBot", Color3.fromRGB(140, 80, 30))
 toggle(tabCombat, "TB Wall Check", "tbWallCheck", Color3.fromRGB(60, 90, 180))
 slider(tabCombat, "TB Radius",     "tbRadius", 6, 60, 2)
