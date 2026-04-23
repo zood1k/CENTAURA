@@ -169,15 +169,18 @@ local function restoreAntiLag()
     end
     antilagOriginals = {}
 end
-local antilagConn
+local antilagConn, antilagLightingConn
 local function setAntiLag(on)
     if on then
         for _, v in ipairs(Workspace:GetDescendants()) do applyAntiLag(v) end
         for _, v in ipairs(Lighting:GetDescendants()) do applyAntiLag(v) end
         if antilagConn then antilagConn:Disconnect() end
+        if antilagLightingConn then antilagLightingConn:Disconnect() end
         antilagConn = Workspace.DescendantAdded:Connect(applyAntiLag)
+        antilagLightingConn = Lighting.DescendantAdded:Connect(applyAntiLag)
     else
         if antilagConn then antilagConn:Disconnect(); antilagConn = nil end
+        if antilagLightingConn then antilagLightingConn:Disconnect(); antilagLightingConn = nil end
         restoreAntiLag()
     end
 end
