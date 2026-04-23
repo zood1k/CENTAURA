@@ -28,6 +28,12 @@ local _firesignal     = (rawget(_G, "firesignal")) or firesignal
 local _getrawmt       = (rawget(_G, "getrawmetatable")) or getrawmetatable
 local _setreadonly    = (rawget(_G, "setreadonly")) or setreadonly
 
+-- ===== lifecycle =====
+local RUNNING = true
+local CONNECTIONS = {}
+local function track(conn) table.insert(CONNECTIONS, conn); return conn end
+-- все task.spawn лупы чекают RUNNING. aimbot/fly коннекшны тоже.
+
 -- ===== state =====
 local S = {
     speedHack    = false, walkSpeed = 40,
@@ -111,13 +117,14 @@ end
 -- ========================================================
 -- Anti-AFK
 -- ========================================================
-LP.Idled:Connect(function()
+track(LP.Idled:Connect(function()
+    if not RUNNING then return end
     if not S.antiAFK then return end
     pcall(function()
         VirtualInputManager:SendKeyEvent(true,  "Space", false, game); task.wait(0.1)
         VirtualInputManager:SendKeyEvent(false, "Space", false, game)
     end)
-end)
+end))
 
 -- ========================================================
 -- Movement (speed / jump / noclip / fly / inf jump)
@@ -125,7 +132,7 @@ end)
 
 -- Ленивая переустановка каждые 0.3s: найти активного чара, выставить WS/JP
 task.spawn(function()
-    while task.wait(0.3) do
+    while RUNNING and task.wait(0.3) do
         local _, hum = getHRP()
         if hum then
             if S.speedHack and hum.WalkSpeed ~= S.walkSpeed then
@@ -141,17 +148,17 @@ task.spawn(function()
 end)
 
 -- Infinite Jump
-UserInputService.JumpRequest:Connect(function()
-    if not S.infJump then return end
+track(UserInputService.JumpRequest:Connect(function()
+    if not RUNNING or not S.infJump then return end
     local _, hum = getHRP()
     if hum then
         pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
     end
-end)
+end))
 
 -- Noclip: выключаем CanCollide на всех частях активного чара
 task.spawn(function()
-    while task.wait(0.1) do
+    while RUNNING and task.wait(0.1) do
         if S.noclip then
             local c = getActiveCharacter()
             if c then
@@ -225,7 +232,7 @@ local function computeRoleFor(pl)
     return "Innocent"
 end
 task.spawn(function()
-    while task.wait(0.5) do S.role = computeRoleFor(LP) end
+    while RUNNING and task.wait(0.5) do S.role = computeRoleFor(LP) end
 end)
 
 -- ========================================================
@@ -253,7 +260,7 @@ local function hookRemote(r)
     end)
 end
 for _, v in ipairs(ReplicatedStorage:GetDescendants()) do hookRemote(v) end
-ReplicatedStorage.DescendantAdded:Connect(hookRemote)
+track(ReplicatedStorage.DescendantAdded:Connect(hookRemote))
 
 -- ========================================================
 -- Aimbot + Silent Aim
@@ -312,7 +319,8 @@ end
 local aimKeyCode = Enum.KeyCode[S.aimKey] or Enum.KeyCode.E
 -- Aimbot: целится в HumanoidRootPart (дефолт — стабильнее чем Head), строит CFrame через
 -- lookAt с Vector3.yAxis (никакого roll-а — камера не "кривится"). Default smooth = 1 (snap).
-RunService.RenderStepped:Connect(function()
+track(RunService.RenderStepped:Connect(function()
+    if not RUNNING then return end
     if not (S.aimbot and UserInputService:IsKeyDown(aimKeyCode)) then return end
     local target = getNearestEnemy(false)
     if not target then return end
@@ -327,7 +335,7 @@ RunService.RenderStepped:Connect(function()
     else
         Camera.CFrame = Camera.CFrame:Lerp(desired, smooth)
     end
-end)
+end))
 
 -- Silent Aim: подменяем Mouse.Hit / Mouse.Target
 local silentAimInstalled = false
@@ -368,7 +376,7 @@ local function setSilentAim(on) if on then installSilentAim() end end
 -- Kill Aura
 -- ========================================================
 task.spawn(function()
-    while task.wait(0.12) do
+    while RUNNING and task.wait(0.12) do
         if S.killAura then
             local c = getActiveCharacter()
             if c then
@@ -399,7 +407,7 @@ end)
 -- Trigger Bot (raycast wall check)
 -- ========================================================
 task.spawn(function()
-    while task.wait(0.04) do
+    while RUNNING and task.wait(0.04) do
         if S.triggerBot then
             local target = getNearestEnemy(S.tbWallCheck)
             if target then
@@ -503,7 +511,7 @@ local function ensureTracer(pl)
 end
 
 task.spawn(function()
-    while task.wait(0.1) do
+    while RUNNING and task.wait(0.1) do
         local anyESP = S.espNames or S.espBox or S.espTracers or S.teamChams
         for _, pl in ipairs(Players:GetPlayers()) do
             if pl ~= LP then
@@ -572,7 +580,7 @@ task.spawn(function()
         end
     end
 end)
-Players.PlayerRemoving:Connect(clearESPFor)
+track(Players.PlayerRemoving:Connect(clearESPFor))
 
 -- ========================================================
 -- Automation
@@ -605,12 +613,12 @@ local function clickGUIMatching(patterns)
 end
 
 task.spawn(function()
-    while task.wait(0.8) do
+    while RUNNING and task.wait(0.8) do
         if S.autoCase then clickGUIMatching({"opencase","unlock","^case$","open case"}) end
     end
 end)
 task.spawn(function()
-    while task.wait(1) do
+    while RUNNING and task.wait(1) do
         if S.autoRespawn then
             local _, hum = getHRP()
             if hum and hum.Health <= 0 then pcall(function() LP:LoadCharacter() end) end
@@ -862,15 +870,39 @@ destroyBtn.TextColor3 = Color3.fromRGB(255,255,255)
 destroyBtn.Font = Enum.Font.GothamBold; destroyBtn.TextSize = 12
 destroyBtn.Text = "Unload CENTAURA"
 Instance.new("UICorner", destroyBtn).CornerRadius = UDim.new(0, 6)
-destroyBtn.MouseButton1Click:Connect(function()
+-- Full unload: disconnect все connections, выключаем RUNNING, сносим ESP/fly,
+-- сбрасываем S флаги, восстанавливаем metatable (silent aim).
+local origMTIndex
+local function doUnload()
+    RUNNING = false
+    -- сброс флагов
+    S.speedHack = false; S.jumpHack = false; S.infJump = false
+    S.noclip = false; S.fly = false; S.antiAFK = false
+    S.silentAim = false; S.aimbot = false; S.killAura = false; S.triggerBot = false
+    S.espNames = false; S.espBox = false; S.espTracers = false; S.teamChams = false
+    S.autoCase = false; S.autoRespawn = false
+    -- останавливаем fly
+    pcall(stopFly)
+    -- сносим ESP
     for pl, _ in pairs(espStore) do clearESPFor(pl) end
-    gui:Destroy()
-end)
+    -- восстановление WS/JP/гравитации
+    local _, hum = getHRP()
+    if hum then
+        pcall(function() hum.WalkSpeed = 16; hum.JumpPower = 50 end)
+    end
+    -- отключаем все tracked connections
+    for _, c in ipairs(CONNECTIONS) do pcall(function() c:Disconnect() end) end
+    CONNECTIONS = {}
+    -- silent aim: восстанавливаем __index если инсталлили (хук теперь no-op б/c S.silentAim=false)
+    -- но чтобы было чисто — не трогаем metatable (опасно если другой скрипт уже перехукнул)
+    if gui and gui.Parent then gui:Destroy() end
+end
+destroyBtn.MouseButton1Click:Connect(doUnload)
 
-UserInputService.InputBegan:Connect(function(i, gpe)
-    if gpe then return end
+track(UserInputService.InputBegan:Connect(function(i, gpe)
+    if not RUNNING or gpe then return end
     if i.KeyCode == Enum.KeyCode.RightShift then root.Visible = not root.Visible end
-end)
+end))
 
 selectTab("Player")
 notify("CENTAURA", "MvS2 v2 loaded · by @zood3llotgk", 4)
