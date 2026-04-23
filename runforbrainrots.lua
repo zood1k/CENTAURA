@@ -1,25 +1,23 @@
--- CENTAURA :: Run For Brainrots! (v2 · HARD MODE)
+-- CENTAURA :: Run For Brainrots! (v3 · HARD MODE)
 -- By @zood3llotgk
 --
--- v2 fixes:
---   * Auto Collect: strictly "CollectTouch" only; auto-nocollide visual coin parts
---     that get attached to the player so they don't block movement.
---   * Auto Pickup: skips anything inside your base (display statues, placed mounts).
---   * Auto Upgrade: clicks GUI upgrade buttons via firesignal / getconnections.
---   * Auto Buy Speed: mutes ShowNotification OnClientEvent while running
---     to hide the spammy red "Not enough money!" popups.
---   * Auto Rebirth: clicks GUI rebirth buttons + extended candidate remotes.
---   * ESP: highlights RUNNING brainrots (Model+Humanoid outside base), not statues.
---   * Anti-Fall removed.
+-- v3 fixes:
+--   * CollectTouch scan teper ТОЛЬКО v tvoyem plote (ne Workspace) — fix sbora
+--   * Nashli tvoy plot cherez Plots/Bases/Tycoons + Owner value/attribute
+--   * Ubrali Heartbeat polling po descendants (bylo prichinoy laga)
+--   * WalkSpeed/JumpPower derzhatsya cherez GetPropertyChangedSignal
+--   * Coin-fix na character cherez DescendantAdded (a ne kazhdyy frame)
+--   * Noclip — per-tick s kesh parts
+--   * Auto Pickup propuskayet tolko tvoy plot (ne vse plots)
 
-local Players            = game:GetService("Players")
-local ReplicatedStorage  = game:GetService("ReplicatedStorage")
-local RunService         = game:GetService("RunService")
-local VirtualInputManager= game:GetService("VirtualInputManager")
-local UserInputService   = game:GetService("UserInputService")
-local StarterGui         = game:GetService("StarterGui")
-local Workspace          = game:GetService("Workspace")
-local LP                 = Players.LocalPlayer
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local RunService          = game:GetService("RunService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local UserInputService    = game:GetService("UserInputService")
+local StarterGui          = game:GetService("StarterGui")
+local Workspace           = game:GetService("Workspace")
+local LP                  = Players.LocalPlayer
 
 -- ===== executor feature detection =====
 local function _G_get(name)
@@ -74,11 +72,10 @@ local S = {
     speedHack    = false,
     jumpHack     = false,
     antiAFK      = true,
-    muteSpam     = true,   -- автомьют красных ошибок
+    muteSpam     = true,
 
     walkSpeed    = 60,
     jumpPower    = 80,
-    collectRange = 2000,
 }
 
 local function notify(t, x, d)
@@ -96,42 +93,62 @@ local function hrp()
            c and c:FindFirstChildOfClass("Humanoid")
 end
 
--- ===== helpers =====
-local function isDescendantOfCharacter(inst)
-    local c = char()
-    return c and inst:IsDescendantOf(c)
-end
-
--- эвристика: "в базе игрока"
-local function isInPlayerBase(inst)
-    local p = inst.Parent
-    while p and p ~= Workspace do
-        local n = p.Name or ""
-        local low = string.lower(n)
-        if n == tostring(LP.UserId) or n == LP.Name
-           or low:find("base") or low:find("plot") or low:find("tycoon")
-           or low:find("display") or low:find("pedestal") or low:find("mount")
-           or low:find("slot") then
-            -- проверяем что именно наша база — ищем в пути наш UserId/Name
-            local q = inst.Parent
-            while q and q ~= Workspace do
-                if q.Name == tostring(LP.UserId) or q.Name == LP.Name then
-                    return true
-                end
-                q = q.Parent
-            end
-            -- если не смогли подтвердить что наша — всё равно считаем базой
-            -- (display/pedestal/slot — это витрина, трогать не нужно)
-            if low:find("display") or low:find("pedestal")
-               or low:find("slot") or low:find("mount") then
-                return true
-            end
-            return false
+-- ===== find player's plot =====
+local PLOT_FOLDER_PAT = {"plots","bases","tycoons","playerplots","playerbases","map","maps"}
+local function isOwnedByMe(inst)
+    if not inst then return false end
+    local ownerVal = inst:FindFirstChild("Owner")
+    if ownerVal then
+        if ownerVal.Value == LP then return true end
+        if typeof(ownerVal.Value) == "string" and
+           (ownerVal.Value == LP.Name or ownerVal.Value == tostring(LP.UserId)) then
+            return true
         end
-        p = p.Parent
     end
+    local a1 = inst:GetAttribute("Owner")
+    if a1 ~= nil and (a1 == LP.UserId or a1 == tostring(LP.UserId) or a1 == LP.Name) then
+        return true
+    end
+    local a2 = inst:GetAttribute("OwnerUserId") or inst:GetAttribute("UserId")
+    if a2 == LP.UserId then return true end
+    if inst.Name == LP.Name or inst.Name == tostring(LP.UserId) then return true end
     return false
 end
+
+local myPlot = nil
+local function findMyPlot()
+    -- прямой дочерний по имени
+    for _, c in ipairs(Workspace:GetChildren()) do
+        if c.Name == LP.Name or c.Name == tostring(LP.UserId) then
+            return c
+        end
+    end
+    -- в контейнере "Plots"/"Bases"/...
+    for _, c in ipairs(Workspace:GetChildren()) do
+        local low = string.lower(c.Name or "")
+        local isContainer = false
+        for _, pat in ipairs(PLOT_FOLDER_PAT) do
+            if low == pat or low:find(pat) then isContainer = true; break end
+        end
+        if isContainer then
+            local direct = c:FindFirstChild(LP.Name) or c:FindFirstChild(tostring(LP.UserId))
+            if direct then return direct end
+            for _, ch in ipairs(c:GetChildren()) do
+                if isOwnedByMe(ch) then return ch end
+            end
+        end
+    end
+    return nil
+end
+
+task.spawn(function()
+    while true do
+        if not myPlot or not myPlot.Parent then
+            myPlot = findMyPlot()
+        end
+        task.wait(3)
+    end
+end)
 
 -- ===== anti-AFK =====
 LP.Idled:Connect(function()
@@ -143,25 +160,28 @@ LP.Idled:Connect(function()
 end)
 
 -- ===== movement =====
-local function applyMove()
-    local _, hum = hrp()
-    if hum then
-        if S.speedHack then hum.WalkSpeed = S.walkSpeed end
-        if S.jumpHack  then hum.JumpPower = S.jumpPower; hum.UseJumpPower = true end
+local function applySpeed(hum)
+    if S.speedHack and hum then
+        if hum.WalkSpeed ~= S.walkSpeed then hum.WalkSpeed = S.walkSpeed end
     end
 end
-RunService.Heartbeat:Connect(function()
-    local c = char(); if not c then return end
-    if S.noclip then
-        for _, p in ipairs(c:GetDescendants()) do
-            if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
-        end
+local function applyJump(hum)
+    if S.jumpHack and hum then
+        hum.UseJumpPower = true
+        if hum.JumpPower ~= S.jumpPower then hum.JumpPower = S.jumpPower end
     end
-    applyMove()
-end)
+end
 
--- ===== убрать "monet коллайдят игрока" =====
--- любой BasePart прилипший к нашему персонажу с coin/cash/bill именем — делаем пустышкой
+local function bindHumanoid(hum)
+    if not hum then return end
+    applySpeed(hum); applyJump(hum)
+    pcall(function()
+        hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function() applySpeed(hum) end)
+        hum:GetPropertyChangedSignal("JumpPower"):Connect(function() applyJump(hum) end)
+    end)
+end
+
+-- ===== coin-fix on character (only on new descendants) =====
 local COIN_KW = {"coin","cash","bill","dollar","collect","drop","money","green"}
 local function isCoinName(n)
     n = string.lower(n or "")
@@ -170,103 +190,110 @@ local function isCoinName(n)
     end
     return false
 end
-RunService.Heartbeat:Connect(function()
+local function softenPart(v)
+    if not v or not v:IsA("BasePart") then return end
+    local c = char()
+    if c and v == c.PrimaryPart then return end
+    pcall(function()
+        v.CanCollide = false
+        v.CanQuery   = false
+        v.CanTouch   = false
+        v.Massless   = true
+    end)
+end
+local function fixCharDescendant(v)
+    if v:IsA("BasePart") and isCoinName(v.Name) then softenPart(v) end
+end
+
+-- ===== noclip: cache character parts =====
+local charParts = {}
+local function rebuildCharParts()
+    table.clear(charParts)
     local c = char(); if not c then return end
-    for _, v in ipairs(c:GetDescendants()) do
-        if v:IsA("BasePart") and v ~= c.PrimaryPart and isCoinName(v.Name) then
+    for _, p in ipairs(c:GetDescendants()) do
+        if p:IsA("BasePart") then table.insert(charParts, p) end
+    end
+end
+
+local function onCharacterAdded(c)
+    task.wait(0.1)
+    local hum = c:FindFirstChildOfClass("Humanoid")
+    bindHumanoid(hum)
+    rebuildCharParts()
+    c.DescendantAdded:Connect(function(v)
+        if v:IsA("BasePart") then
+            table.insert(charParts, v)
+            fixCharDescendant(v)
+        end
+    end)
+    c.DescendantRemoving:Connect(function(v)
+        for i, p in ipairs(charParts) do
+            if p == v then table.remove(charParts, i); break end
+        end
+    end)
+    -- initial coin-fix pass
+    for _, v in ipairs(c:GetDescendants()) do fixCharDescendant(v) end
+end
+if LP.Character then task.spawn(onCharacterAdded, LP.Character) end
+LP.CharacterAdded:Connect(onCharacterAdded)
+
+-- noclip tick (не каждый фрейм — 0.1с достаточно)
+task.spawn(function()
+    while task.wait(0.1) do
+        if S.noclip then
+            for _, p in ipairs(charParts) do
+                if p.Parent and p.CanCollide then p.CanCollide = false end
+            end
+        end
+    end
+end)
+
+-- ===== Auto Collect (СТРОГО CollectTouch в пределах моего плота) =====
+local function collectInPlot(root, plot)
+    for _, v in ipairs(plot:GetDescendants()) do
+        if v:IsA("BasePart") and v.Name == "CollectTouch" then
             pcall(function()
-                v.CanCollide = false
-                v.CanQuery   = false
-                v.CanTouch   = false
-                v.Massless   = true
+                _firetouch(root, v, 0)
+                _firetouch(root, v, 1)
             end)
         end
     end
-end)
-
--- ===== Auto Collect =====
-local function touchAllNamed(root, partName, range)
-    for _, v in ipairs(Workspace:GetDescendants()) do
-        if v:IsA("BasePart") and v.Name == partName
-           and not isInPlayerBase(v) then
-            if (root.Position - v.Position).Magnitude <= range then
-                pcall(function()
-                    _firetouch(root, v, 0)
-                    _firetouch(root, v, 1)
-                end)
-            end
-        end
-    end
 end
 task.spawn(function()
-    while task.wait(0.1) do
+    while task.wait(0.25) do
         if S.autoCollect then
             local root = hrp()
             if root then
-                touchAllNamed(root, "CollectTouch", S.collectRange)
+                if myPlot and myPlot.Parent then
+                    collectInPlot(root, myPlot)
+                else
+                    -- плот не найден — пробуем весь Workspace, только CollectTouch
+                    for _, v in ipairs(Workspace:GetDescendants()) do
+                        if v:IsA("BasePart") and v.Name == "CollectTouch" then
+                            pcall(function()
+                                _firetouch(root, v, 0); _firetouch(root, v, 1)
+                            end)
+                        end
+                    end
+                end
             end
         end
     end
 end)
 
--- ===== Auto Pickup =====
+-- ===== Auto Pickup (пропускаем ТОЛЬКО мой плот) =====
 task.spawn(function()
-    while task.wait(0.15) do
+    while task.wait(0.25) do
         if S.autoPickup then
             for _, v in ipairs(Workspace:GetDescendants()) do
-                if not isInPlayerBase(v) and not isDescendantOfCharacter(v) then
-                    if v:IsA("ProximityPrompt") and v.Enabled then
-                        pcall(function() v.HoldDuration = 0; _fireprompt(v) end)
-                    elseif v:IsA("ClickDetector") then
-                        pcall(function() _fireclick(v) end)
-                    end
+                if myPlot and v:IsDescendantOf(myPlot) then
+                    -- skip own plot
+                elseif v:IsA("ProximityPrompt") and v.Enabled then
+                    pcall(function() v.HoldDuration = 0; _fireprompt(v) end)
+                elseif v:IsA("ClickDetector") then
+                    pcall(function() _fireclick(v) end)
                 end
             end
-        end
-    end
-end)
-
--- ===== GUI click helpers =====
-local function fireButton(btn)
-    pcall(function()
-        if _firesignal then _firesignal(btn.MouseButton1Click) return end
-        if _getconnections then
-            for _, c in ipairs(_getconnections(btn.MouseButton1Click)) do
-                pcall(function()
-                    if c.Fire then c:Fire() elseif c.Function then c.Function() end
-                end)
-            end
-        end
-    end)
-end
-
--- forward ref — присваивается ниже при создании ScreenGui
-local CENTAURA_GUI = nil
-
-local function clickButtonsMatching(patterns)
-    local pg = LP:FindFirstChild("PlayerGui"); if not pg then return end
-    for _, g in ipairs(pg:GetDescendants()) do
-        if (g:IsA("TextButton") or g:IsA("ImageButton"))
-           and not (CENTAURA_GUI and g:IsDescendantOf(CENTAURA_GUI)) then
-            if g.Visible and g.Active and g.AbsoluteSize.X > 0 then
-                local name = string.lower(g.Name or "")
-                local text = (g:IsA("TextButton") and string.lower(g.Text or "")) or ""
-                for _, p in ipairs(patterns) do
-                    if name:find(p) or text:find(p) then
-                        fireButton(g); break
-                    end
-                end
-            end
-        end
-    end
-end
-
--- ===== Auto Upgrade =====
-task.spawn(function()
-    while task.wait(0.35) do
-        if S.autoUpgrade then
-            clickButtonsMatching({"upgrade","upgd","improve","level"})
-            tryFire(UPG_NAMES)
         end
     end
 end)
@@ -294,12 +321,57 @@ local function setShowNotifMuted(on)
     end
 end
 
+-- forward ref (должен быть до clickButtonsMatching)
+local CENTAURA_GUI = nil
+
+-- ===== GUI click helpers =====
+local function fireButton(btn)
+    pcall(function()
+        if _firesignal then _firesignal(btn.MouseButton1Click); return end
+        if _getconnections then
+            for _, c in ipairs(_getconnections(btn.MouseButton1Click)) do
+                pcall(function()
+                    if c.Fire then c:Fire() elseif c.Function then c.Function() end
+                end)
+            end
+        end
+    end)
+end
+
+local function clickButtonsMatching(patterns)
+    local pg = LP:FindFirstChild("PlayerGui"); if not pg then return end
+    for _, g in ipairs(pg:GetDescendants()) do
+        if (g:IsA("TextButton") or g:IsA("ImageButton"))
+           and not (CENTAURA_GUI and g:IsDescendantOf(CENTAURA_GUI)) then
+            if g.Visible and g.Active and g.AbsoluteSize.X > 0 then
+                local name = string.lower(g.Name or "")
+                local text = (g:IsA("TextButton") and string.lower(g.Text or "")) or ""
+                for _, p in ipairs(patterns) do
+                    if name:find(p) or text:find(p) then
+                        fireButton(g); break
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- ===== Auto Upgrade =====
+task.spawn(function()
+    while task.wait(0.35) do
+        if S.autoUpgrade then
+            clickButtonsMatching({"upgrade","upgd","improve"})
+            tryFire(UPG_NAMES)
+        end
+    end
+end)
+
 -- ===== Auto Buy Speed =====
 task.spawn(function()
     while task.wait(0.35) do
         if S.autoSpeed then
             if S.muteSpam then setShowNotifMuted(true) end
-            clickButtonsMatching({"speed","buyspeed","purchasespeed"})
+            clickButtonsMatching({"buyspeed","purchasespeed","speedpurchase"})
             for lvl = 1, 100 do tryFire(SPEED_NAMES, lvl) end
             tryFire(SPEED_NAMES)
         else
@@ -333,13 +405,12 @@ local function isLikelyRunningBrainrot(m)
     if not m:IsA("Model") then return false end
     if Players:GetPlayerFromCharacter(m) then return false end
     if not m:FindFirstChildOfClass("Humanoid") then return false end
-    if isInPlayerBase(m) then return false end
-    -- убедимся что имеет BasePart для Adornee
+    if myPlot and m:IsDescendantOf(myPlot) then return false end
     if not m:FindFirstChildWhichIsA("BasePart") then return false end
     return true
 end
 task.spawn(function()
-    while task.wait(0.5) do
+    while task.wait(0.6) do
         if S.espBrainrots then
             for _, m in ipairs(Workspace:GetDescendants()) do
                 if isLikelyRunningBrainrot(m) and not espHolders[m] then
@@ -373,11 +444,11 @@ gui.Name           = "CENTAURA_RFB"
 gui.ResetOnSpawn   = false
 gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-CENTAURA_GUI = gui  -- чтобы clickButtonsMatching не жал свои же тоглы
+CENTAURA_GUI = gui
 
 local frame = Instance.new("Frame", gui)
-frame.Size             = UDim2.new(0, 300, 0, 500)
-frame.Position         = UDim2.new(0, 20, 0.5, -250)
+frame.Size             = UDim2.new(0, 300, 0, 480)
+frame.Position         = UDim2.new(0, 20, 0.5, -240)
 frame.BackgroundColor3 = Color3.fromRGB(16, 16, 22)
 frame.BorderSizePixel  = 0
 frame.Active           = true
@@ -417,7 +488,7 @@ scroll.ScrollBarImageColor3  = Color3.fromRGB(150, 80, 255)
 local layout = Instance.new("UIListLayout", scroll)
 layout.Padding = UDim.new(0, 5)
 
-local function toggle(name, key, accent)
+local function toggle(name, key, accent, onToggle)
     local b = Instance.new("TextButton", scroll)
     b.Size             = UDim2.new(1, -4, 0, 30)
     b.BorderSizePixel  = 0
@@ -435,8 +506,7 @@ local function toggle(name, key, accent)
     b.MouseButton1Click:Connect(function()
         S[key] = not S[key]; r()
         notify("CENTAURA", name .. ": " .. (S[key] and "ON" or "OFF"))
-        if key == "espBrainrots" and not S[key] then clearESP() end
-        if key == "muteSpam" and not S[key] then setShowNotifMuted(false) end
+        if onToggle then pcall(onToggle, S[key]) end
     end)
 end
 
@@ -472,6 +542,11 @@ local function slider(label, key, min, max, step)
     local function apply(v)
         v = math.clamp(v, min, max); S[key] = v
         val.Text = tostring(v); l.Text = label .. ": " .. tostring(v)
+        local _, hum = hrp()
+        if hum then
+            if key == "walkSpeed" and S.speedHack then hum.WalkSpeed = v end
+            if key == "jumpPower" and S.jumpHack  then hum.JumpPower = v end
+        end
     end
     minus.MouseButton1Click:Connect(function() apply(S[key] - step) end)
     plus.MouseButton1Click:Connect(function()  apply(S[key] + step) end)
@@ -482,15 +557,27 @@ toggle("Auto Pickup Brainrot", "autoPickup",   Color3.fromRGB(180, 80, 40))
 toggle("Auto Upgrade (GUI)",   "autoUpgrade",  Color3.fromRGB(30, 90, 180))
 toggle("Auto Buy Speed",       "autoSpeed")
 toggle("Auto Rebirth",         "autoRebirth")
-toggle("Mute Error Popups",    "muteSpam",     Color3.fromRGB(140, 40, 80))
-toggle("ESP Brainrots",        "espBrainrots", Color3.fromRGB(150, 50, 200))
+toggle("Mute Error Popups",    "muteSpam",     Color3.fromRGB(140, 40, 80), function(on)
+    if not on then setShowNotifMuted(false) end
+end)
+toggle("ESP Brainrots",        "espBrainrots", Color3.fromRGB(150, 50, 200), function(on)
+    if not on then clearESP() end
+end)
 toggle("Noclip",               "noclip")
-toggle("Speed Hack",           "speedHack")
-toggle("Jump Hack",            "jumpHack")
+toggle("Speed Hack",           "speedHack", nil, function(on)
+    local _, hum = hrp(); if hum then
+        if on then hum.WalkSpeed = S.walkSpeed else hum.WalkSpeed = 16 end
+    end
+end)
+toggle("Jump Hack",            "jumpHack", nil, function(on)
+    local _, hum = hrp(); if hum then
+        if on then hum.UseJumpPower = true; hum.JumpPower = S.jumpPower
+        else hum.JumpPower = 50 end
+    end
+end)
 toggle("Anti-AFK",             "antiAFK")
-slider("Walk Speed",    "walkSpeed",    16,  500,  8)
-slider("Jump Power",    "jumpPower",    50,  500, 10)
-slider("Collect Range", "collectRange", 50, 5000, 100)
+slider("Walk Speed",    "walkSpeed",    16, 500, 8)
+slider("Jump Power",    "jumpPower",    50, 500, 10)
 
 local hint = Instance.new("TextLabel", scroll)
 hint.Size                   = UDim2.new(1, -4, 0, 22)
@@ -507,8 +594,4 @@ UserInputService.InputBegan:Connect(function(i, gpe)
     end
 end)
 
-LP.CharacterAdded:Connect(function()
-    task.wait(1); applyMove()
-end)
-
-notify("CENTAURA", "Run For Brainrots! v2 loaded · by @zood3llotgk", 4)
+notify("CENTAURA", "Run For Brainrots! v3 loaded · by @zood3llotgk", 4)
