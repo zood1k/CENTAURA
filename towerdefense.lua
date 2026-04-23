@@ -248,7 +248,7 @@ end
 local function clearMobESP()
     for m,_ in pairs(mobESP) do removeMobESP(m) end
 end
-local mobFolderConn
+local mobFolderConn, mobFolderRemoveConn
 local function setMobESP(on)
     if on then
         local f = getMobsFolder()
@@ -267,10 +267,12 @@ local function setMobESP(on)
         end
         for _, m in ipairs(f:GetChildren()) do addMobESP(m) end
         if mobFolderConn then mobFolderConn:Disconnect() end
+        if mobFolderRemoveConn then mobFolderRemoveConn:Disconnect() end
         mobFolderConn = f.ChildAdded:Connect(addMobESP)
-        f.ChildRemoved:Connect(removeMobESP)
+        mobFolderRemoveConn = f.ChildRemoved:Connect(removeMobESP)
     else
         if mobFolderConn then mobFolderConn:Disconnect(); mobFolderConn = nil end
+        if mobFolderRemoveConn then mobFolderRemoveConn:Disconnect(); mobFolderRemoveConn = nil end
         clearMobESP()
     end
 end
@@ -327,7 +329,7 @@ end
 local function clearRangeESP()
     for t,_ in pairs(rangeESP) do removeRangeESP(t) end
 end
-local towersConn
+local towersConn, towersRemoveConn
 local function setRangeESP(on)
     if on then
         local f = getTowersFolder()
@@ -344,10 +346,12 @@ local function setRangeESP(on)
         end
         for _, t in ipairs(f:GetChildren()) do addRangeESP(t) end
         if towersConn then towersConn:Disconnect() end
+        if towersRemoveConn then towersRemoveConn:Disconnect() end
         towersConn = f.ChildAdded:Connect(addRangeESP)
-        f.ChildRemoved:Connect(removeRangeESP)
+        towersRemoveConn = f.ChildRemoved:Connect(removeRangeESP)
     else
         if towersConn then towersConn:Disconnect(); towersConn = nil end
+        if towersRemoveConn then towersRemoveConn:Disconnect(); towersRemoveConn = nil end
         clearRangeESP()
     end
 end
@@ -381,9 +385,14 @@ hookAllButtons()
 
 local function resolvePath(path)
     local cur = game
+    local first = true
     for part in string.gmatch(path, "[^%.]+") do
-        cur = cur:FindFirstChild(part)
-        if not cur then return nil end
+        if first then
+            first = false -- skip "Game" root token from GetFullName()
+        else
+            cur = cur:FindFirstChild(part)
+            if not cur then return nil end
+        end
     end
     return cur
 end

@@ -98,7 +98,7 @@ local PLOT_FOLDER_PAT = {"plots","bases","tycoons","playerplots","playerbases","
 local function isOwnedByMe(inst)
     if not inst then return false end
     local ownerVal = inst:FindFirstChild("Owner")
-    if ownerVal then
+    if ownerVal and ownerVal:IsA("ValueBase") then
         if ownerVal.Value == LP then return true end
         if typeof(ownerVal.Value) == "string" and
            (ownerVal.Value == LP.Name or ownerVal.Value == tostring(LP.UserId)) then
